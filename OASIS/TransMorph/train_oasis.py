@@ -93,10 +93,26 @@ def compute_hd95(ground_truth, prediction):
 
 
 def jacobian_determinant(flow):
+    # flow: (C, H, W, D) where C==ndim (3)
+    # convert to (H, W, D, C)
     displacement = np.moveaxis(flow, 0, -1)
-    grid = np.stack(np.meshgrid(*[np.arange(size) for size in displacement.shape[:-1]], indexing="ij"), axis=-1)
-    gradients = np.gradient(displacement + grid)
-    return np.linalg.det(np.stack(gradients, axis=-2))
+    # create identity grid and add to displacement to get mapping coordinates
+    grid = np.stack(np.meshgrid(*[np.arange(s) for s in displacement.shape[:-1]], indexing="ij"), axis=-1)
+    field = displacement + grid
+
+    # For each vector component, compute partial derivatives wrt spatial axes
+    # grads_c is list of 3 arrays (d(component)/dx, d(component)/dy, d(component)/dz)
+    jac_components = []
+    for c in range(field.shape[-1]):
+        grads = np.gradient(field[..., c])  # returns tuple (d/dx, d/dy, d/dz)
+        # stack to (H, W, D, 3) where last dim are derivatives for this component
+        jac_components.append(np.stack(grads, axis=-1))
+
+    # Stack components to shape (H, W, D, 3, 3) where [i,j] = d(component_i)/d(coord_j)
+    jac = np.stack(jac_components, axis=-2)
+
+    # Determinant over last two axes -> (H, W, D)
+    return np.linalg.det(jac)
 
 
 @torch.no_grad()
