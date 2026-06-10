@@ -32,7 +32,9 @@ class LocalNCC(nn.Module):
         self.window_size = window_size
         self.eps = eps
 
-    def forward(self, target, prediction):
+    def forward(self, target, prediction, mask=None):
+        target = target.float()
+        prediction = prediction.float()
         win = self.window_size
         filt = target.new_ones((1, 1, win, win, win))
         padding = win // 2
@@ -47,14 +49,25 @@ class LocalNCC(nn.Module):
         cross = product_sum - pred_mean * target_sum - target_mean * pred_sum + target_mean * pred_mean * win_size
         target_var = target_sq_sum - 2 * target_mean * target_sum + target_mean.square() * win_size
         pred_var = pred_sq_sum - 2 * pred_mean * pred_sum + pred_mean.square() * win_size
-        return -(cross.square() / (target_var * pred_var + self.eps)).mean()
+        ncc = cross.square() / (target_var * pred_var + self.eps)
+        if mask is None:
+            return -ncc.mean()
+        mask = mask.float()
+        return -(ncc * mask).sum() / mask.sum().clamp_min(1.0)
 
 
 def gradient_loss(flow):
+    flow = flow.float()
     dx = (flow[:, :, 1:, :, :] - flow[:, :, :-1, :, :]).square().mean()
     dy = (flow[:, :, :, 1:, :] - flow[:, :, :, :-1, :]).square().mean()
     dz = (flow[:, :, :, :, 1:] - flow[:, :, :, :, :-1]).square().mean()
     return (dx + dy + dz) / 3.0
+
+
+def foreground_mask(image):
+    threshold = image.amin(dim=(2, 3, 4), keepdim=True) + 1e-3
+    mask = (image > threshold).float()
+    return F.max_pool3d(mask, kernel_size=5, stride=1, padding=2)
 
 
 def dice_score(prediction, target, labels=range(1, 36)):
@@ -91,9 +104,9 @@ def create_grad_scaler(enabled):
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-def train_epoch(model, loader, optimizer, image_loss_fn, lambda_reg, device, scaler, amp_enabled):
+def train_epoch(model, loader, optimizer, image_loss_fn, lambda_reg, use_mask, device, scaler, amp_enabled):
     model.train()
-    totals = np.zeros(3, dtype=np.float64)
+    totals = np.zeros(5, dtype=np.float64)
     steps = 0
 
     for batch in tqdm(loader, desc="train", leave=False):
@@ -102,33 +115,51 @@ def train_epoch(model, loader, optimizer, image_loss_fn, lambda_reg, device, sca
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, amp_enabled):
                 warped, flow = model(torch.cat((moving, fixed), dim=1))
-                image_loss = image_loss_fn(fixed, warped)
-                regularization = gradient_loss(flow)
-                loss = image_loss + lambda_reg * regularization
+            mask = foreground_mask(fixed) if use_mask else None
+            image_loss = image_loss_fn(fixed, warped, mask) if isinstance(image_loss_fn, LocalNCC) else image_loss_fn(fixed, warped)
+            regularization = gradient_loss(flow)
+            loss = image_loss + lambda_reg * regularization
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            totals += [loss.item(), image_loss.item(), regularization.item()]
+            totals += [
+                loss.item(), image_loss.item(), regularization.item(),
+                flow.detach().float().abs().mean().item(), flow.detach().float().abs().max().item(),
+            ]
             steps += 1
 
     return tuple(totals / max(steps, 1))
 
 
 @torch.no_grad()
-def validate(model, label_transform, loader, image_loss_fn, lambda_reg, device):
+def validate(model, label_transform, loader, image_loss_fn, lambda_reg, use_mask, device):
     model.eval()
     losses = []
     dice_scores = []
+    initial_dice_scores = []
+    flow_means = []
+    flow_maxes = []
     for source, target, source_seg, target_seg in tqdm(loader, desc="validate", leave=False):
         source = source.to(device, non_blocking=True).float()
         target = target.to(device, non_blocking=True).float()
         source_seg = source_seg.to(device, non_blocking=True).float()
         target_seg = target_seg.to(device, non_blocking=True).long()
         warped, flow = model(torch.cat((source, target), dim=1))
-        losses.append((image_loss_fn(target, warped) + lambda_reg * gradient_loss(flow)).item())
+        mask = foreground_mask(target) if use_mask else None
+        image_loss = image_loss_fn(target, warped, mask) if isinstance(image_loss_fn, LocalNCC) else image_loss_fn(target, warped)
+        losses.append((image_loss + lambda_reg * gradient_loss(flow)).item())
         warped_seg = label_transform(source_seg, flow).round().long()
         dice_scores.append(dice_score(warped_seg, target_seg))
-    return float(np.mean(losses)), float(np.mean(dice_scores))
+        initial_dice_scores.append(dice_score(source_seg.long(), target_seg))
+        flow_means.append(flow.float().abs().mean().item())
+        flow_maxes.append(flow.float().abs().max().item())
+    return (
+        float(np.mean(losses)),
+        float(np.mean(dice_scores)),
+        float(np.mean(initial_dice_scores)),
+        float(np.mean(flow_means)),
+        float(np.max(flow_maxes)),
+    )
 
 
 def main():
@@ -142,9 +173,10 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lambda", dest="lambda_reg", type=float, default=0.01)
+    parser.add_argument("--use-mask", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--loss", choices=("ncc", "mse"), default="ncc")
     parser.add_argument("--ncc-window", type=int, default=9)
-    parser.add_argument("--warmup-epochs", type=int, default=10)
+    parser.add_argument("--warmup-epochs", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--disable-amp", action="store_true")
@@ -190,24 +222,47 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
     log_path = output.parent / f"{output.stem}_log.csv"
     with log_path.open("w", newline="") as file:
-        csv.writer(file).writerow(["epoch", "train_loss", "image_loss", "gradient_loss", "val_loss", "val_dice", "lr", "seconds"])
+        csv.writer(file).writerow([
+            "epoch", "train_loss", "image_loss", "gradient_loss",
+            "train_flow_mean", "train_flow_max", "val_loss", "val_dice",
+            "initial_dice", "dice_gain", "val_flow_mean", "val_flow_max", "lr", "seconds",
+        ])
 
     best_dice = -1.0
+    initial_val_loss, initial_val_dice, initial_dice, initial_flow_mean, initial_flow_max = validate(
+        model, label_transform, val_loader, image_loss_fn, args.lambda_reg, args.use_mask, device
+    )
+    print(
+        f"Initial baseline val_loss={initial_val_loss:.6f} val_dice={initial_val_dice:.6f} "
+        f"gain={initial_val_dice - initial_dice:+.6f} "
+        f"flow={initial_flow_mean:.4f}/{initial_flow_max:.4f}"
+    )
+
     for epoch in range(args.epochs):
         start = time.time()
-        train_loss, image_loss, reg_loss = train_epoch(
-            model, train_loader, optimizer, image_loss_fn, args.lambda_reg, device, scaler, amp_enabled
+        train_loss, image_loss, reg_loss, train_flow_mean, train_flow_max = train_epoch(
+            model, train_loader, optimizer, image_loss_fn, args.lambda_reg, args.use_mask,
+            device, scaler, amp_enabled
         )
-        val_loss, val_dice = validate(model, label_transform, val_loader, image_loss_fn, args.lambda_reg, device)
+        val_loss, val_dice, initial_dice, val_flow_mean, val_flow_max = validate(
+            model, label_transform, val_loader, image_loss_fn, args.lambda_reg, args.use_mask, device
+        )
+        dice_gain = val_dice - initial_dice
         scheduler.step()
         elapsed = time.time() - start
         lr = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch + 1}/{args.epochs} loss={train_loss:.6f} "
-            f"val_loss={val_loss:.6f} val_dice={val_dice:.6f} lr={lr:.2e} time={elapsed:.1f}s"
+            f"img={image_loss:.6f} reg={reg_loss:.6f} "
+            f"val_loss={val_loss:.6f} val_dice={val_dice:.6f} gain={dice_gain:+.6f} "
+            f"flow={val_flow_mean:.4f}/{val_flow_max:.4f} lr={lr:.2e} time={elapsed:.1f}s"
         )
         with log_path.open("a", newline="") as file:
-            csv.writer(file).writerow([epoch + 1, train_loss, image_loss, reg_loss, val_loss, val_dice, lr, elapsed])
+            csv.writer(file).writerow([
+                epoch + 1, train_loss, image_loss, reg_loss,
+                train_flow_mean, train_flow_max, val_loss, val_dice,
+                initial_dice, dice_gain, val_flow_mean, val_flow_max, lr, elapsed,
+            ])
 
         if val_dice > best_dice:
             best_dice = val_dice
