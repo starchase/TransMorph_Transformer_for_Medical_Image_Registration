@@ -4,16 +4,19 @@
 import argparse
 import copy
 import csv
+import datetime
 import glob
 import os
-import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import matplotlib.pyplot as plt
 import numpy as np
+import scipy.ndimage
+from scipy.spatial import cKDTree
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -32,7 +35,7 @@ class LocalNCC(nn.Module):
         self.window_size = window_size
         self.eps = eps
 
-    def forward(self, target, prediction, mask=None):
+    def forward(self, target, prediction):
         target = target.float()
         prediction = prediction.float()
         win = self.window_size
@@ -50,10 +53,7 @@ class LocalNCC(nn.Module):
         target_var = target_sq_sum - 2 * target_mean * target_sum + target_mean.square() * win_size
         pred_var = pred_sq_sum - 2 * pred_mean * pred_sum + pred_mean.square() * win_size
         ncc = cross.square() / (target_var * pred_var + self.eps)
-        if mask is None:
-            return -ncc.mean()
-        mask = mask.float()
-        return -(ncc * mask).sum() / mask.sum().clamp_min(1.0)
+        return -ncc.mean()
 
 
 def gradient_loss(flow):
@@ -62,12 +62,6 @@ def gradient_loss(flow):
     dy = (flow[:, :, :, 1:, :] - flow[:, :, :, :-1, :]).square().mean()
     dz = (flow[:, :, :, :, 1:] - flow[:, :, :, :, :-1]).square().mean()
     return (dx + dy + dz) / 3.0
-
-
-def foreground_mask(image):
-    threshold = image.amin(dim=(2, 3, 4), keepdim=True) + 1e-3
-    mask = (image > threshold).float()
-    return F.max_pool3d(mask, kernel_size=5, stride=1, padding=2)
 
 
 def dice_score(prediction, target, labels=range(1, 36)):
@@ -79,6 +73,54 @@ def dice_score(prediction, target, labels=range(1, 36)):
         if denominator > 0:
             scores.append((2.0 * (pred_mask & target_mask).sum().float() / denominator).item())
     return float(np.mean(scores)) if scores else 0.0
+
+
+def compute_hd95(ground_truth, prediction):
+    if not ground_truth.any() or not prediction.any():
+        return np.nan
+    pred_border = prediction ^ scipy.ndimage.binary_erosion(prediction)
+    gt_border = ground_truth ^ scipy.ndimage.binary_erosion(ground_truth)
+    pred_points = np.argwhere(pred_border)
+    gt_points = np.argwhere(gt_border)
+    if not len(pred_points) or not len(gt_points):
+        return np.nan
+    pred_tree = cKDTree(pred_points)
+    gt_tree = cKDTree(gt_points)
+    return max(
+        np.percentile(gt_tree.query(pred_points)[0], 95),
+        np.percentile(pred_tree.query(gt_points)[0], 95),
+    )
+
+
+def jacobian_determinant(flow):
+    displacement = np.moveaxis(flow, 0, -1)
+    grid = np.stack(np.meshgrid(*[np.arange(size) for size in displacement.shape[:-1]], indexing="ij"), axis=-1)
+    gradients = np.gradient(displacement + grid)
+    return np.linalg.det(np.stack(gradients, axis=-2))
+
+
+@torch.no_grad()
+def save_qualitative_results(model, label_transform, dataset, output_dir, epoch, device):
+    source, target, source_seg, target_seg = dataset[min(9, len(dataset) - 1)]
+    source = source.unsqueeze(0).to(device).float()
+    target = target.unsqueeze(0).to(device).float()
+    source_seg = source_seg.unsqueeze(0).to(device).float()
+    target_seg = target_seg.unsqueeze(0).to(device).long()
+    warped, flow = model(torch.cat((source, target), dim=1))
+    warped_seg = label_transform(source_seg, flow).round().long()
+    z_index = source.shape[-1] // 2
+    tensors = (source, target, warped, source_seg, target_seg, warped_seg)
+    titles = ("Source", "Target", "Warped Source", "Source Label", "Target Label", "Warped Label")
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    for axis, tensor, title in zip(axes.flat, tensors, titles):
+        image = np.rot90(tensor[0, 0, :, :, z_index].detach().cpu().numpy(), -1)
+        axis.imshow(image, cmap="gray" if "Label" not in title else "tab20")
+        axis.set_title(title)
+        axis.axis("off")
+    fig.suptitle(f"Epoch {epoch} - Sample default")
+    fig.tight_layout()
+    fig.savefig(output_dir / f"vis_epoch_{epoch:04d}_default.png")
+    plt.close(fig)
 
 
 def create_model(config_name, image_size, device):
@@ -104,7 +146,7 @@ def create_grad_scaler(enabled):
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-def train_epoch(model, loader, optimizer, image_loss_fn, lambda_reg, use_mask, device, scaler, amp_enabled):
+def train_epoch(model, loader, optimizer, image_loss_fn, lambda_reg, device, scaler, amp_enabled):
     model.train()
     totals = np.zeros(5, dtype=np.float64)
     steps = 0
@@ -115,8 +157,7 @@ def train_epoch(model, loader, optimizer, image_loss_fn, lambda_reg, use_mask, d
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, amp_enabled):
                 warped, flow = model(torch.cat((moving, fixed), dim=1))
-            mask = foreground_mask(fixed) if use_mask else None
-            image_loss = image_loss_fn(fixed, warped, mask) if isinstance(image_loss_fn, LocalNCC) else image_loss_fn(fixed, warped)
+            image_loss = image_loss_fn(fixed, warped)
             regularization = gradient_loss(flow)
             loss = image_loss + lambda_reg * regularization
             scaler.scale(loss).backward()
@@ -132,33 +173,52 @@ def train_epoch(model, loader, optimizer, image_loss_fn, lambda_reg, use_mask, d
 
 
 @torch.no_grad()
-def validate(model, label_transform, loader, image_loss_fn, lambda_reg, use_mask, device):
+def validate(model, label_transform, loader, image_loss_fn, lambda_reg, device, compute_extra=False):
     model.eval()
     losses = []
     dice_scores = []
     initial_dice_scores = []
     flow_means = []
     flow_maxes = []
+    hd95_scores = []
+    jac_scores = []
+    magnitude_scores = []
     for source, target, source_seg, target_seg in tqdm(loader, desc="validate", leave=False):
         source = source.to(device, non_blocking=True).float()
         target = target.to(device, non_blocking=True).float()
         source_seg = source_seg.to(device, non_blocking=True).float()
         target_seg = target_seg.to(device, non_blocking=True).long()
         warped, flow = model(torch.cat((source, target), dim=1))
-        mask = foreground_mask(target) if use_mask else None
-        image_loss = image_loss_fn(target, warped, mask) if isinstance(image_loss_fn, LocalNCC) else image_loss_fn(target, warped)
+        image_loss = image_loss_fn(target, warped)
         losses.append((image_loss + lambda_reg * gradient_loss(flow)).item())
         warped_seg = label_transform(source_seg, flow).round().long()
         dice_scores.append(dice_score(warped_seg, target_seg))
         initial_dice_scores.append(dice_score(source_seg.long(), target_seg))
         flow_means.append(flow.float().abs().mean().item())
         flow_maxes.append(flow.float().abs().max().item())
+        if compute_extra:
+            magnitude_scores.append(torch.linalg.vector_norm(flow.float(), dim=1).mean().item())
+            flow_np = flow[0].float().cpu().numpy()
+            target_np = target[0, 0].cpu().numpy()
+            jac_det = jacobian_determinant(flow_np)
+            jac_scores.append(float(((jac_det <= 0) & (target_np > 0.01)).sum() / max((target_np > 0.01).sum(), 1)))
+            warped_np = warped_seg[0, 0].cpu().numpy()
+            target_seg_np = target_seg[0, 0].cpu().numpy()
+            case_hd95 = [
+                compute_hd95(target_seg_np == label, warped_np == label)
+                for label in range(1, 36)
+                if np.any(target_seg_np == label) and np.any(warped_np == label)
+            ]
+            hd95_scores.append(float(np.nanmean(case_hd95)) if case_hd95 else np.nan)
     return (
         float(np.mean(losses)),
         float(np.mean(dice_scores)),
         float(np.mean(initial_dice_scores)),
         float(np.mean(flow_means)),
         float(np.max(flow_maxes)),
+        float(np.nanmean(hd95_scores)) if compute_extra else np.nan,
+        float(np.mean(jac_scores)) if compute_extra else np.nan,
+        float(np.mean(magnitude_scores)) if compute_extra else np.nan,
     )
 
 
@@ -173,11 +233,14 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lambda", dest="lambda_reg", type=float, default=0.01)
-    parser.add_argument("--use-mask", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--loss", choices=("ncc", "mse"), default="ncc")
     parser.add_argument("--ncc-window", type=int, default=9)
-    parser.add_argument("--warmup-epochs", type=int, default=0)
+    parser.add_argument("--warmup-epochs", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=10)
+    parser.add_argument("--vis-every", type=int, default=5)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--threshold", type=float, default=0.0)
+    parser.add_argument("--warm-start", type=int, default=10)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--disable-amp", action="store_true")
     args = parser.parse_args()
@@ -218,60 +281,128 @@ def main():
 
     amp_enabled = device.type == "cuda" and not args.disable_amp
     scaler = create_grad_scaler(amp_enabled)
-    output = Path(args.output)
+    input_output_path = Path(args.output)
+    timestamp = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime("%Y%m%d_%H%M%S")
+    run_dir = input_output_path.parent / f"{input_output_path.stem}_{timestamp}"
+    output = run_dir / f"{input_output_path.stem}{input_output_path.suffix}"
     output.parent.mkdir(parents=True, exist_ok=True)
-    log_path = output.parent / f"{output.stem}_log.csv"
+    print(f"Output directory for this run: {output.parent}")
+
+    log_path = output.parent / "train_log.csv"
+    config_path = output.parent / "config.txt"
+    total_params = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    with config_path.open("w") as file:
+        file.write("Training Configuration:\n")
+        file.write(f"Device: {device}\n")
+        file.write(f"Model Architecture: {args.transmorph_config}\n")
+        file.write(f"Total Parameters: {total_params:,}\n")
+        file.write(f"Epochs: {args.epochs}\n")
+        file.write(f"Batch Size: {args.batch_size}\n")
+        file.write(f"Lambda: {args.lambda_reg}\n")
+        file.write(f"Loss: {args.loss}\n")
+        file.write("Use Mask: False\n")
+        file.write(f"LR: {args.lr}\n")
+        file.write(f"Arguments: {vars(args)}\n")
     with log_path.open("w", newline="") as file:
         csv.writer(file).writerow([
-            "epoch", "train_loss", "image_loss", "gradient_loss",
-            "train_flow_mean", "train_flow_max", "val_loss", "val_dice",
-            "initial_dice", "dice_gain", "val_flow_mean", "val_flow_max", "lr", "seconds",
+            "epoch", "train_loss", "train_img_loss", "train_grad_loss",
+            "train_feature_edge_loss", "val_dsc", "val_hd95", "val_jac", "val_mag",
         ])
 
     best_dice = -1.0
-    initial_val_loss, initial_val_dice, initial_dice, initial_flow_mean, initial_flow_max = validate(
-        model, label_transform, val_loader, image_loss_fn, args.lambda_reg, args.use_mask, device
+    initial_values = validate(
+        model, label_transform, val_loader, image_loss_fn, args.lambda_reg, device
     )
+    initial_val_loss, initial_val_dice, initial_dice, initial_flow_mean, initial_flow_max = initial_values[:5]
     print(
         f"Initial baseline val_loss={initial_val_loss:.6f} val_dice={initial_val_dice:.6f} "
         f"gain={initial_val_dice - initial_dice:+.6f} "
         f"flow={initial_flow_mean:.4f}/{initial_flow_max:.4f}"
     )
 
+    loss_history = []
+    val_dsc_history = []
+    epoch_times = []
     for epoch in range(args.epochs):
         start = time.time()
         train_loss, image_loss, reg_loss, train_flow_mean, train_flow_max = train_epoch(
-            model, train_loader, optimizer, image_loss_fn, args.lambda_reg, args.use_mask,
-            device, scaler, amp_enabled
+            model, train_loader, optimizer, image_loss_fn, args.lambda_reg, device, scaler, amp_enabled
         )
-        val_loss, val_dice, initial_dice, val_flow_mean, val_flow_max = validate(
-            model, label_transform, val_loader, image_loss_fn, args.lambda_reg, args.use_mask, device
+        val_values = validate(
+            model, label_transform, val_loader, image_loss_fn, args.lambda_reg, device
         )
+        val_loss, val_dice, initial_dice, val_flow_mean, val_flow_max = val_values[:5]
         dice_gain = val_dice - initial_dice
+        is_new_best = val_dice > best_dice
+        epoch_num = epoch + 1
+        compute_extra = epoch_num in (1, 3, 5, 7) or epoch_num % 10 == 0 or (is_new_best and val_dice > 0.77)
+        if compute_extra:
+            extra_values = validate(
+                model, label_transform, val_loader, image_loss_fn, args.lambda_reg, device, compute_extra=True
+            )
+            val_hd95, val_jac, val_mag = extra_values[5:]
+        else:
+            val_hd95, val_jac, val_mag = np.nan, np.nan, np.nan
         scheduler.step()
         elapsed = time.time() - start
+        epoch_times.append(elapsed)
+        loss_history.append(train_loss)
+        val_dsc_history.append(val_dice)
         lr = optimizer.param_groups[0]["lr"]
+        peak_memory = torch.cuda.max_memory_allocated(device) / (1024 ** 2) if device.type == "cuda" else 0.0
+        metrics = (
+            f", HD95: {val_hd95:.2f}, Jac: {val_jac:.4f}, Mag: {val_mag:.4f}"
+            if compute_extra else ""
+        )
         print(
-            f"Epoch {epoch + 1}/{args.epochs} loss={train_loss:.6f} "
-            f"img={image_loss:.6f} reg={reg_loss:.6f} "
-            f"val_loss={val_loss:.6f} val_dice={val_dice:.6f} gain={dice_gain:+.6f} "
-            f"flow={val_flow_mean:.4f}/{val_flow_max:.4f} lr={lr:.2e} time={elapsed:.1f}s"
+            f"Epoch {epoch_num}/{args.epochs}, Loss: {train_loss:.6f}, Img: {image_loss:.6f}, "
+            f"Grad: {reg_loss:.6f}, FeatureEdge: 0.000000, Val DSC: {val_dice:.6f}{metrics}, "
+            f"LR: {lr:.6f}, Time: {elapsed:.2f}s, Peak: {peak_memory:.2f}MB, "
+            f"Gain: {dice_gain:+.6f}, Flow: {val_flow_mean:.4f}/{val_flow_max:.4f}"
         )
         with log_path.open("a", newline="") as file:
             csv.writer(file).writerow([
-                epoch + 1, train_loss, image_loss, reg_loss,
-                train_flow_mean, train_flow_max, val_loss, val_dice,
-                initial_dice, dice_gain, val_flow_mean, val_flow_max, lr, elapsed,
+                epoch_num, f"{train_loss:.6f}", f"{image_loss:.6f}", f"{reg_loss:.6f}", "0.000000",
+                f"{val_dice:.6f}", f"{val_hd95:.2f}" if compute_extra else "",
+                f"{val_jac:.6f}" if compute_extra else "", f"{val_mag:.6f}" if compute_extra else "",
             ])
 
-        if val_dice > best_dice:
+        if compute_extra and args.vis_every != 0:
+            save_qualitative_results(model, label_transform, val_set, output.parent, epoch_num, device)
+
+        if is_new_best:
             best_dice = val_dice
             torch.save(model.state_dict(), output.parent / f"{output.stem}_best.pt")
-        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
-            torch.save(model.state_dict(), output.parent / f"{output.stem}_epoch{epoch + 1}.pt")
+            print(f"Saved new best model with DSC: {best_dice:.6f} (HD95: {val_hd95:.2f}, Jac: {val_jac:.4f})")
+        if args.save_every > 0 and epoch_num % args.save_every == 0:
+            checkpoint = output.parent / f"{output.stem}_epoch{epoch_num}.pt"
+            torch.save(model.state_dict(), checkpoint)
+            print(f"Checkpoint saved to {checkpoint}")
+
+        if epoch_num % 10 == 0:
+            fig, axis_loss = plt.subplots(figsize=(10, 6))
+            axis_loss.plot(range(1, epoch_num + 1), loss_history, color="tab:red", label="Train Loss")
+            axis_loss.set_xlabel("Epoch")
+            axis_loss.set_ylabel("Train Loss", color="tab:red")
+            axis_dice = axis_loss.twinx()
+            axis_dice.plot(range(1, epoch_num + 1), val_dsc_history, color="tab:blue", label="Val DSC")
+            axis_dice.set_ylabel("Val DSC", color="tab:blue")
+            fig.tight_layout()
+            fig.savefig(output.parent / f"learning_curves_epoch{epoch_num}.png", dpi=150)
+            plt.close(fig)
+
+        if len(loss_history) >= args.warm_start + args.patience + 1:
+            recent = loss_history[-args.patience:]
+            best_past = min(loss_history[:-args.patience])
+            if all(max(best_past - loss, 0) < args.threshold for loss in recent):
+                print(f"Early stopping at epoch {epoch_num}")
+                break
 
     torch.save(model.state_dict(), output)
     print(f"Final model saved to {output}")
+    with config_path.open("a") as file:
+        file.write(f"Average Epoch Time: {np.mean(epoch_times):.2f} s\n")
+        file.write(f"Peak GPU Memory: {torch.cuda.max_memory_allocated(device) / (1024 ** 2) if device.type == 'cuda' else 0.0:.2f} MB\n")
 
 
 if __name__ == "__main__":
