@@ -797,6 +797,21 @@ class SpatialTransformer(nn.Module):
 
         return nnf.grid_sample(src, new_locs, align_corners=False, mode=self.mode)
 
+class IntegrateVelocityField(nn.Module):
+    """Integrate a stationary velocity field with scaling and squaring."""
+
+    def __init__(self, steps=7):
+        super().__init__()
+        if steps < 0:
+            raise ValueError('Integration steps must be non-negative.')
+        self.steps = steps
+
+    def forward(self, velocity, spatial_transform):
+        displacement = velocity / (2 ** self.steps)
+        for _ in range(self.steps):
+            displacement = displacement + spatial_transform(displacement, displacement)
+        return displacement
+
 class TransMorph(nn.Module):
     def __init__(self, config):
         '''
@@ -839,6 +854,12 @@ class TransMorph(nn.Module):
             kernel_size=3,
         )
         self.spatial_trans = SpatialTransformer(config.img_size)
+        self.integration_steps = getattr(config, 'integration_steps', 0)
+        self.integrate = (
+            IntegrateVelocityField(self.integration_steps)
+            if self.integration_steps > 0 else None
+        )
+        self.latest_velocity = None
         self.avg_pool = nn.AvgPool3d(3, stride=2, padding=1)
 
     def forward(self, x):
@@ -863,10 +884,12 @@ class TransMorph(nn.Module):
         x = self.up1(x, f2)
         x = self.up2(x, f3)
         x = self.up3(x, f4)
-        flow = self.reg_head(x)
-        flow = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)(flow)
-        out = self.spatial_trans(source, flow)
-        return out, flow#, out_feats
+        velocity = self.reg_head(x)
+        velocity = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)(velocity)
+        self.latest_velocity = velocity
+        displacement = self.integrate(velocity, self.spatial_trans) if self.integrate is not None else velocity
+        out = self.spatial_trans(source, displacement)
+        return out, displacement#, out_feats
 
 
 CONFIGS = {

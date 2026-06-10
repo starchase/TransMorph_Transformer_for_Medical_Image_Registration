@@ -30,7 +30,7 @@ import models.TransMorph as TransMorph
 
 
 class LocalNCC(nn.Module):
-    def __init__(self, window_size=9, eps=1e-5):
+    def __init__(self, window_size=9, eps=1e-3):
         super().__init__()
         self.window_size = window_size
         self.eps = eps
@@ -139,9 +139,10 @@ def save_qualitative_results(model, label_transform, dataset, output_dir, epoch,
     plt.close(fig)
 
 
-def create_model(config_name, image_size, device):
+def create_model(config_name, image_size, integration_steps, device):
     config = copy.deepcopy(CONFIGS_TM[config_name])
     config.img_size = tuple(image_size)
+    config.integration_steps = integration_steps
     return TransMorph.TransMorph(config).to(device)
 
 
@@ -149,7 +150,9 @@ def autocast_context(device, enabled):
     if not enabled:
         return nullcontext()
     if hasattr(torch, "autocast"):
-        return torch.autocast(device_type=device.type, dtype=torch.float16)
+        supports_bfloat16 = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+        dtype = torch.bfloat16 if supports_bfloat16 else torch.float16
+        return torch.autocast(device_type=device.type, dtype=dtype)
     return torch.cuda.amp.autocast()
 
 
@@ -162,28 +165,42 @@ def create_grad_scaler(enabled):
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-def train_epoch(model, loader, optimizer, image_loss_fn, lambda_reg, device, scaler, amp_enabled):
+def train_epoch(model, loader, optimizer, image_loss_fn, lambda_reg, bidirectional, accumulation_steps, device, scaler, amp_enabled):
     model.train()
     totals = np.zeros(5, dtype=np.float64)
     steps = 0
+    pending_steps = 0
+    optimizer.zero_grad(set_to_none=True)
 
     for batch in tqdm(loader, desc="train", leave=False):
         source, target = (tensor.to(device, non_blocking=True).float() for tensor in batch[:2])
-        for moving, fixed in ((source, target), (target, source)):
-            optimizer.zero_grad(set_to_none=True)
+        pairs = ((source, target), (target, source)) if bidirectional else ((source, target),)
+        for moving, fixed in pairs:
             with autocast_context(device, amp_enabled):
                 warped, flow = model(torch.cat((moving, fixed), dim=1))
             image_loss = image_loss_fn(fixed, warped)
             regularization = gradient_loss(flow)
             loss = image_loss + lambda_reg * regularization
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.scale(loss / accumulation_steps).backward()
+            pending_steps += 1
+            if pending_steps == accumulation_steps:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                pending_steps = 0
             totals += [
                 loss.item(), image_loss.item(), regularization.item(),
                 flow.detach().float().abs().mean().item(), flow.detach().float().abs().max().item(),
             ]
             steps += 1
+
+    if pending_steps:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
 
     return tuple(totals / max(steps, 1))
 
@@ -243,23 +260,30 @@ def main():
     parser.add_argument("--train-dir", default="/root/autodl-tmp/OASIS_L2R_2021_task03/All/")
     parser.add_argument("--val-dir", default="/root/autodl-tmp/OASIS_L2R_2021_task03/Test/")
     parser.add_argument("--output", default="/root/autodl-tmp/models/oasis_transmorph.pt")
-    parser.add_argument("--transmorph-config", default="TransMorph-Large", choices=sorted(CONFIGS_TM))
+    parser.add_argument("--transmorph-config", default="TransMorph", choices=sorted(CONFIGS_TM))
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--lambda", dest="lambda_reg", type=float, default=0.01)
+    parser.add_argument("--lambda", dest="lambda_reg", type=float, default=1.2)
     parser.add_argument("--loss", choices=("ncc", "mse"), default="ncc")
     parser.add_argument("--ncc-window", type=int, default=9)
-    parser.add_argument("--warmup-epochs", type=int, default=10)
+    parser.add_argument("--warmup-epochs", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--vis-every", type=int, default=5)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--threshold", type=float, default=0.0)
     parser.add_argument("--warm-start", type=int, default=10)
+    parser.add_argument("--integration-steps", type=int, default=5)
+    parser.add_argument("--bidirectional", action="store_true")
+    parser.add_argument("--accumulation-steps", type=int, default=2)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--disable-amp", action="store_true")
     args = parser.parse_args()
+    if args.integration_steps < 0:
+        parser.error("--integration-steps must be non-negative.")
+    if args.accumulation_steps < 1:
+        parser.error("--accumulation-steps must be positive.")
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -278,7 +302,7 @@ def main():
     val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=device.type == "cuda")
 
     image_size = tuple(train_set[0][0].shape[1:])
-    model = create_model(args.transmorph_config, image_size, device)
+    model = create_model(args.transmorph_config, image_size, args.integration_steps, device)
     label_transform = TransMorph.SpatialTransformer(image_size, mode="nearest").to(device)
     image_loss_fn = LocalNCC(args.ncc_window).to(device) if args.loss == "ncc" else nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, amsgrad=True)
@@ -317,6 +341,9 @@ def main():
         file.write(f"Lambda: {args.lambda_reg}\n")
         file.write(f"Loss: {args.loss}\n")
         file.write("Use Mask: False\n")
+        file.write(f"Integration Steps: {args.integration_steps}\n")
+        file.write(f"Bidirectional Training: {args.bidirectional}\n")
+        file.write(f"Accumulation Steps: {args.accumulation_steps}\n")
         file.write(f"LR: {args.lr}\n")
         file.write(f"Arguments: {vars(args)}\n")
     with log_path.open("w", newline="") as file:
@@ -342,7 +369,8 @@ def main():
     for epoch in range(args.epochs):
         start = time.time()
         train_loss, image_loss, reg_loss, train_flow_mean, train_flow_max = train_epoch(
-            model, train_loader, optimizer, image_loss_fn, args.lambda_reg, device, scaler, amp_enabled
+            model, train_loader, optimizer, image_loss_fn, args.lambda_reg, args.bidirectional,
+            args.accumulation_steps, device, scaler, amp_enabled
         )
         val_values = validate(
             model, label_transform, val_loader, image_loss_fn, args.lambda_reg, device

@@ -206,9 +206,10 @@ def dice_score(prediction, target):
     return float(np.mean(scores)) if scores else float("nan")
 
 
-def create_model(config_name, image_size, device):
+def create_model(config_name, image_size, integration_steps, device):
     config = copy.deepcopy(CONFIGS_TM[config_name])
     config.img_size = tuple(image_size)
+    config.integration_steps = integration_steps
     return TransMorph.TransMorph(config).to(device)
 
 
@@ -284,7 +285,7 @@ def main():
     parser.add_argument("--ct-val-label-dir", default="/root/autodl-tmp/classedAbdomenMRCT_norm_300/val/labels/ct")
     parser.add_argument("--mr-val-label-dir", default="/root/autodl-tmp/classedAbdomenMRCT_norm_300/val/labels/mr")
     parser.add_argument("--output", default="/root/autodl-tmp/models/multimodal_transmorph.pt")
-    parser.add_argument("--transmorph-config", default="TransMorph-Large", choices=sorted(CONFIGS_TM))
+    parser.add_argument("--transmorph-config", default="TransMorph", choices=sorted(CONFIGS_TM))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--workers", type=int, default=4)
@@ -298,10 +299,13 @@ def main():
     parser.add_argument("--mind-dilation", type=int, default=2)
     parser.add_argument("--loss-mask-mode", choices=("auto", "none"), default="auto")
     parser.add_argument("--warmup-epochs", type=int, default=10)
+    parser.add_argument("--integration-steps", type=int, default=0)
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--disable-amp", action="store_true")
     args = parser.parse_args()
+    if args.integration_steps < 0:
+        parser.error("--integration-steps must be non-negative.")
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -318,7 +322,7 @@ def main():
     val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=device.type == "cuda")
 
     image_size = tuple(train_set[0]["source"].shape[1:])
-    model = create_model(args.transmorph_config, image_size, device)
+    model = create_model(args.transmorph_config, image_size, args.integration_steps, device)
     label_transform = TransMorph.SpatialTransformer(image_size, mode="nearest").to(device)
     image_loss_fn = ImageLoss(args.image_loss, args.ncc_window, args.mind_radius, args.mind_dilation).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, amsgrad=True)
