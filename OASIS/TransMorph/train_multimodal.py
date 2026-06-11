@@ -13,7 +13,9 @@ from pathlib import Path
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import nibabel as nib
+import matplotlib.pyplot as plt
 import numpy as np
+import scipy.ndimage
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -80,22 +82,24 @@ class MultimodalTrainDataset(Dataset):
 
 class MultimodalValidationDataset(Dataset):
     def __init__(self, ct_dir, mr_dir, ct_label_dir=None, mr_label_dir=None):
-        self.pairs = pair_files(ct_dir, mr_dir)
+        ct_files = list_nifti(ct_dir)
+        mr_files = list_nifti(mr_dir)
+        self.pairs = [(ct_path, mr_path) for ct_path in ct_files for mr_path in mr_files]
         self.ct_labels = {case_key(path): path for path in list_nifti(ct_label_dir)}
         self.mr_labels = {case_key(path): path for path in list_nifti(mr_label_dir)}
         if not self.pairs:
-            raise ValueError("Validation CT and MR directories do not contain matching cases.")
+            raise ValueError("Validation CT and MR directories must contain NIfTI files.")
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, index):
         ct_path, mr_path = self.pairs[index]
-        key = case_key(ct_path)
         sample = {"source": load_volume(ct_path), "target": load_volume(mr_path)}
-        if key in self.ct_labels and key in self.mr_labels:
-            sample["source_label"] = load_volume(self.ct_labels[key], label=True)
-            sample["target_label"] = load_volume(self.mr_labels[key], label=True)
+        ct_key, mr_key = case_key(ct_path), case_key(mr_path)
+        if ct_key in self.ct_labels and mr_key in self.mr_labels:
+            sample["source_label"] = load_volume(self.ct_labels[ct_key], label=True)
+            sample["target_label"] = load_volume(self.mr_labels[mr_key], label=True)
         return sample
 
 
@@ -206,6 +210,119 @@ def dice_score(prediction, target):
     return float(np.mean(scores)) if scores else float("nan")
 
 
+def compute_hd95(ground_truth, prediction):
+    if ground_truth.sum() == 0 or prediction.sum() == 0:
+        return float("nan")
+    pred_border = prediction ^ scipy.ndimage.binary_erosion(prediction)
+    gt_border = ground_truth ^ scipy.ndimage.binary_erosion(ground_truth)
+    pred_distance = scipy.ndimage.distance_transform_edt(~pred_border)
+    gt_distance = scipy.ndimage.distance_transform_edt(~gt_border)
+    distances = np.concatenate((gt_distance[pred_border], pred_distance[gt_border]))
+    return float(np.percentile(distances, 95)) if distances.size else float("nan")
+
+
+def jacobian_determinant(flow):
+    flow = np.moveaxis(flow, 0, -1)
+    gradients = [np.gradient(flow[..., axis]) for axis in range(3)]
+    jacobian = np.empty(flow.shape[:-1] + (3, 3), dtype=np.float32)
+    for row in range(3):
+        for col in range(3):
+            jacobian[..., row, col] = gradients[row][col]
+        jacobian[..., row, row] += 1.0
+    return np.linalg.det(jacobian)
+
+
+def save_qualitative_results(model, label_transform, dataset, output_dir, epoch, device):
+    sample = dataset[min(9, len(dataset) - 1)]
+    source = sample["source"].unsqueeze(0).to(device).float()
+    target = sample["target"].unsqueeze(0).to(device).float()
+    model.eval()
+    with torch.no_grad():
+        warped, flow = model(torch.cat((source, target), dim=1))
+        warped_label = None
+        if "source_label" in sample:
+            source_label = sample["source_label"].unsqueeze(0).to(device).float()
+            warped_label = label_transform(source_label, flow).round()
+
+    slice_idx = source.shape[-1] // 2
+
+    def image_slice(tensor):
+        return np.rot90(tensor[0, 0, :, :, slice_idx].detach().cpu().numpy(), -1)
+
+    source_slice, target_slice, warped_slice = map(image_slice, (source, target, warped))
+    flow_np = flow[0].detach().cpu().numpy()
+    flow_components = np.rot90(flow_np[:, :, :, slice_idx], -1, axes=(1, 2))
+    max_flow = max(float(np.abs(flow_components).max()), 1e-6)
+    flow_rgb = np.clip(np.moveaxis(flow_components, 0, -1) / (2 * max_flow) + 0.5, 0, 1)
+    jac_slice = np.rot90(jacobian_determinant(flow_np)[:, :, slice_idx], -1)
+    vmin = min(source_slice.min(), target_slice.min(), warped_slice.min())
+    vmax = max(source_slice.max(), target_slice.max(), warped_slice.max())
+
+    fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+    panels = (
+        (source_slice, "Source CT", "gray", vmin, vmax),
+        (target_slice, "Target MR", "gray", vmin, vmax),
+        (source_slice - target_slice, "Source - Target", "bwr", -1, 1),
+        (warped_slice - target_slice, "Warped - Target", "bwr", -1, 1),
+    )
+    for axis, (image, title, cmap, low, high) in zip(axes[0], panels):
+        axis.imshow(image, cmap=cmap, vmin=low, vmax=high)
+        axis.set_title(title)
+        axis.axis("off")
+
+    def add_label_contours(axis, background, labels, title, dashed=False):
+        axis.imshow(image_slice(background), cmap="gray", vmin=vmin, vmax=vmax)
+        for label, linestyle in labels:
+            if label is None:
+                continue
+            if label.ndim == 4:
+                label = label.unsqueeze(0)
+            label_slice = image_slice(label)
+            for value in np.unique(label_slice):
+                if value > 0:
+                    axis.contour(label_slice == value, linewidths=0.8, linestyles=linestyle)
+        axis.set_title(title)
+        axis.axis("off")
+
+    add_label_contours(axes[1, 0], source, [(sample.get("source_label"), "solid")], "Source + Labels")
+    add_label_contours(axes[1, 1], target, [(sample.get("target_label"), "solid")], "Target + Labels")
+    add_label_contours(axes[1, 2], warped, [(warped_label, "solid")], "Warped + Labels")
+    add_label_contours(
+        axes[1, 3],
+        target,
+        [(sample.get("target_label"), "dashed"), (warped_label, "solid")],
+        "Result vs GT",
+    )
+
+    axes[2, 0].imshow(flow_rgb)
+    axes[2, 0].set_title("RGB Displacement")
+    axes[2, 0].axis("off")
+    axes[2, 1].imshow(np.linalg.norm(flow_components, axis=0), cmap="viridis")
+    axes[2, 1].set_title("Displacement Magnitude")
+    axes[2, 1].axis("off")
+
+    height, width = source_slice.shape
+    axes[2, 2].imshow(np.zeros_like(source_slice), cmap="gray", vmin=0, vmax=1)
+    dy, dx = flow_components[1], flow_components[2]
+    for x_coord in range(0, width, 10):
+        axes[2, 2].plot(x_coord + dx[:, x_coord], np.arange(height) + dy[:, x_coord], "w-", linewidth=0.5)
+    for y_coord in range(0, height, 10):
+        axes[2, 2].plot(np.arange(width) + dx[y_coord], y_coord + dy[y_coord], "w-", linewidth=0.5)
+    axes[2, 2].set_xlim(0, width)
+    axes[2, 2].set_ylim(height, 0)
+    axes[2, 2].set_title("Deformed Grid")
+    axes[2, 2].axis("off")
+
+    axes[2, 3].imshow(jac_slice, cmap="coolwarm", vmin=0, vmax=2)
+    axes[2, 3].set_title("Jacobian Determinant")
+    axes[2, 3].axis("off")
+
+    fig.suptitle(f"Epoch {epoch}")
+    fig.tight_layout()
+    fig.savefig(output_dir / f"vis_epoch_{epoch:04d}.png", dpi=150)
+    plt.close(fig)
+
+
 def create_model(config_name, image_size, integration_steps, device):
     config = copy.deepcopy(CONFIGS_TM[config_name])
     config.img_size = tuple(image_size)
@@ -254,9 +371,9 @@ def train_epoch(model, loader, optimizer, image_loss_fn, lambda_reg, bend_weight
 
 
 @torch.no_grad()
-def validate(model, label_transform, loader, image_loss_fn, lambda_reg, bend_weight, mask_mode, device):
+def validate(model, label_transform, loader, image_loss_fn, lambda_reg, bend_weight, mask_mode, device, compute_extra=False):
     model.eval()
-    losses, dice_scores = [], []
+    losses, dice_scores, hd95_scores, negative_jacobians, magnitudes = [], [], [], [], []
     for batch in tqdm(loader, desc="validate", leave=False):
         source = batch["source"].to(device, non_blocking=True).float()
         target = batch["target"].to(device, non_blocking=True).float()
@@ -271,7 +388,30 @@ def validate(model, label_transform, loader, image_loss_fn, lambda_reg, bend_wei
             target_label = batch["target_label"].to(device).long()
             warped_label = label_transform(source_label, flow).round().long()
             dice_scores.append(dice_score(warped_label, target_label))
-    return float(np.mean(losses)), float(np.nanmean(dice_scores)) if dice_scores else float("nan")
+            if compute_extra:
+                warped_np = warped_label.cpu().numpy()
+                target_np = target_label.cpu().numpy()
+                label_hd95 = []
+                for label in np.unique(np.concatenate((warped_np, target_np))):
+                    if label > 0:
+                        value = compute_hd95(target_np[0, 0] == label, warped_np[0, 0] == label)
+                        if np.isfinite(value):
+                            label_hd95.append(value)
+                if label_hd95:
+                    hd95_scores.append(float(np.mean(label_hd95)))
+        if compute_extra:
+            flow_np = flow[0].float().cpu().numpy()
+            jacobian = jacobian_determinant(flow_np)
+            target_mask = target[0, 0].cpu().numpy() > 0.01
+            negative_jacobians.append(float(np.mean(jacobian[target_mask] <= 0)) if target_mask.any() else 0.0)
+            magnitudes.append(float(torch.linalg.vector_norm(flow.float(), dim=1).mean().item()))
+    return (
+        float(np.mean(losses)),
+        float(np.nanmean(dice_scores)) if dice_scores else float("nan"),
+        float(np.mean(hd95_scores)) if hd95_scores else float("nan"),
+        float(np.mean(negative_jacobians)) if negative_jacobians else float("nan"),
+        float(np.mean(magnitudes)) if magnitudes else float("nan"),
+    )
 
 
 def main():
@@ -345,32 +485,67 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
     log_path = output.parent / f"{output.stem}_log.csv"
     with log_path.open("w", newline="") as file:
-        csv.writer(file).writerow(["epoch", "train_loss", "image_loss", "gradient_loss", "bending_loss", "val_loss", "val_dice", "lr", "seconds"])
+        csv.writer(file).writerow([
+            "epoch", "train_loss", "image_loss", "gradient_loss", "bending_loss",
+            "val_loss", "val_dsc", "val_hd95", "val_jac", "val_mag", "lr", "seconds",
+        ])
 
-    best_loss = float("inf")
+    best_dsc = 0.0
     for epoch in range(args.epochs):
         start = time.time()
+        epoch_num = epoch + 1
         train_values = train_epoch(
             model, train_loader, optimizer, image_loss_fn, args.lambda_reg, args.bend_weight,
             args.loss_mask_mode, device, scaler, amp_enabled
         )
-        val_loss, val_dice = validate(
-            model, label_transform, val_loader, image_loss_fn, args.lambda_reg, args.bend_weight, args.loss_mask_mode, device
+        val_loss, val_dsc, _, _, _ = validate(
+            model, label_transform, val_loader, image_loss_fn, args.lambda_reg, args.bend_weight,
+            args.loss_mask_mode, device, compute_extra=False
         )
+        is_new_best = val_dsc > best_dsc
+        compute_extra = epoch_num in (1, 3, 5, 7) or epoch_num % 10 == 0 or (is_new_best and val_dsc > 0.77)
+        if compute_extra:
+            val_loss, val_dsc, val_hd95, val_jac, val_mag = validate(
+                model, label_transform, val_loader, image_loss_fn, args.lambda_reg, args.bend_weight,
+                args.loss_mask_mode, device, compute_extra=True
+            )
+        else:
+            val_hd95 = val_jac = val_mag = float("nan")
         scheduler.step()
         elapsed = time.time() - start
         lr = optimizer.param_groups[0]["lr"]
-        print(
-            f"Epoch {epoch + 1}/{args.epochs} loss={train_values[0]:.6f} "
-            f"val_loss={val_loss:.6f} val_dice={val_dice:.6f} lr={lr:.2e} time={elapsed:.1f}s"
-        )
+        if compute_extra:
+            print(
+                f"Epoch {epoch_num}/{args.epochs}, Loss: {train_values[0]:.6f}, "
+                f"Img: {train_values[1]:.6f}, Grad: {train_values[2]:.6f}, "
+                f"Val DSC: {val_dsc:.6f}, HD95: {val_hd95:.2f}, Jac: {val_jac:.4f}, "
+                f"Mag: {val_mag:.4f}, LR: {lr:.6f}, Time: {elapsed:.2f}s"
+            )
+        else:
+            print(
+                f"Epoch {epoch_num}/{args.epochs}, Loss: {train_values[0]:.6f}, "
+                f"Img: {train_values[1]:.6f}, Grad: {train_values[2]:.6f}, "
+                f"Val DSC: {val_dsc:.6f}, LR: {lr:.6f}, Time: {elapsed:.2f}s"
+            )
         with log_path.open("a", newline="") as file:
-            csv.writer(file).writerow([epoch + 1, *train_values, val_loss, val_dice, lr, elapsed])
-        if val_loss < best_loss:
-            best_loss = val_loss
+            csv.writer(file).writerow([
+                epoch_num, *train_values, val_loss, val_dsc,
+                f"{val_hd95:.2f}" if compute_extra else "",
+                f"{val_jac:.6f}" if compute_extra else "",
+                f"{val_mag:.6f}" if compute_extra else "",
+                lr, elapsed,
+            ])
+        if compute_extra:
+            try:
+                save_qualitative_results(model, label_transform, val_set, output.parent, epoch_num, device)
+            except Exception as error:
+                print(f"Failed to save visualization: {error}")
+        if is_new_best:
+            best_dsc = val_dsc
             torch.save(model.state_dict(), output.parent / f"{output.stem}_best.pt")
-        if args.save_every > 0 and (epoch + 1) % args.save_every == 0:
-            torch.save(model.state_dict(), output.parent / f"{output.stem}_epoch{epoch + 1}.pt")
+            print(f"Saved new best model with DSC: {best_dsc:.6f}")
+        if args.save_every > 0 and epoch_num % args.save_every == 0:
+            torch.save(model.state_dict(), output.parent / f"{output.stem}_epoch{epoch_num}.pt")
 
     torch.save(model.state_dict(), output)
     print(f"Final model saved to {output}")
