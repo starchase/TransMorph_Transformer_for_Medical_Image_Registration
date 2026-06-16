@@ -4,6 +4,7 @@
 import argparse
 import copy
 import csv
+import datetime
 import os
 import random
 import time
@@ -81,10 +82,13 @@ class MultimodalTrainDataset(Dataset):
 
 
 class MultimodalValidationDataset(Dataset):
-    def __init__(self, ct_dir, mr_dir, ct_label_dir=None, mr_label_dir=None):
+    def __init__(self, ct_dir, mr_dir, ct_label_dir=None, mr_label_dir=None, paired=False):
         ct_files = list_nifti(ct_dir)
         mr_files = list_nifti(mr_dir)
-        self.pairs = [(ct_path, mr_path) for ct_path in ct_files for mr_path in mr_files]
+        if paired:
+            self.pairs = pair_files(ct_dir, mr_dir)
+        else:
+            self.pairs = [(ct_path, mr_path) for ct_path in ct_files for mr_path in mr_files]
         self.ct_labels = {case_key(path): path for path in list_nifti(ct_label_dir)}
         self.mr_labels = {case_key(path): path for path in list_nifti(mr_label_dir)}
         if not self.pairs:
@@ -156,18 +160,60 @@ class MINDLoss(nn.Module):
         return difference.mean()
 
 
+class MutualInformationLoss(nn.Module):
+    def __init__(self, num_bins=32, sigma_ratio=1.0, chunk_size=262144, eps=1e-6):
+        super().__init__()
+        centers = torch.linspace(0.0, 1.0, num_bins)
+        self.register_buffer("centers", centers)
+        sigma = float(centers[1] - centers[0]) * sigma_ratio
+        self.preterm = 1.0 / (2.0 * sigma ** 2)
+        self.chunk_size = chunk_size
+        self.eps = eps
+
+    def forward(self, target, prediction, mask=None):
+        target = target.float().clamp(0.0, 1.0).flatten(1)
+        prediction = prediction.float().clamp(0.0, 1.0).flatten(1)
+        mask = mask.float().flatten(1) if mask is not None else None
+        centers = self.centers.view(1, 1, -1)
+        joint = target.new_zeros((target.shape[0], self.centers.numel(), self.centers.numel()))
+        count = target.new_zeros((target.shape[0], 1, 1))
+        for start in range(0, target.shape[1], self.chunk_size):
+            end = start + self.chunk_size
+            target_weights = torch.exp(-self.preterm * (target[:, start:end, None] - centers).square())
+            pred_weights = torch.exp(-self.preterm * (prediction[:, start:end, None] - centers).square())
+            target_weights = target_weights / target_weights.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+            pred_weights = pred_weights / pred_weights.sum(dim=-1, keepdim=True).clamp_min(self.eps)
+            if mask is not None:
+                weights = mask[:, start:end, None]
+                target_weights = target_weights * weights
+                pred_weights = pred_weights * weights
+                count += weights.sum(dim=1, keepdim=True)
+            else:
+                count += target_weights.new_full((target.shape[0], 1, 1), end - start)
+            joint += torch.bmm(target_weights.transpose(1, 2), pred_weights)
+        joint = joint / count.clamp_min(1.0)
+        target_prob = joint.sum(dim=2, keepdim=True)
+        pred_prob = joint.sum(dim=1, keepdim=True)
+        independent = target_prob * pred_prob
+        mi = (joint * torch.log((joint + self.eps) / (independent + self.eps))).sum(dim=(1, 2))
+        return -mi.mean()
+
+
 class ImageLoss(nn.Module):
-    def __init__(self, name, ncc_window=9, mind_radius=2, mind_dilation=2):
+    def __init__(self, name, ncc_window=9, mind_radius=2, mind_dilation=2, mi_bins=32):
         super().__init__()
         self.name = name
         self.ncc = LocalNCC(ncc_window)
         self.mind = MINDLoss(mind_radius, mind_dilation)
+        self.mi = MutualInformationLoss(mi_bins)
 
     def forward(self, target, prediction, mask=None):
         if self.name == "ncc":
             return self.ncc(target, prediction, mask)
         if self.name == "mind":
             return self.mind(target, prediction, mask)
+        if self.name == "mi":
+            return self.mi(target, prediction, mask)
         difference = (target - prediction).square()
         if mask is not None:
             return (difference * mask).sum() / mask.sum().clamp_min(1.0)
@@ -197,12 +243,15 @@ def foreground_mask(image):
     return (image > threshold).float()
 
 
-def dice_score(prediction, target):
-    labels = torch.unique(torch.cat((prediction.flatten(), target.flatten())))
+def common_labels(source, target):
+    source_labels = set(torch.unique(source).long().cpu().tolist())
+    target_labels = set(torch.unique(target).long().cpu().tolist())
+    return sorted(label for label in source_labels & target_labels if label != 0)
+
+
+def dice_score(prediction, target, labels):
     scores = []
     for label in labels:
-        if label.item() == 0:
-            continue
         pred_mask, target_mask = prediction == label, target == label
         denominator = pred_mask.sum() + target_mask.sum()
         if denominator > 0:
@@ -358,10 +407,10 @@ def train_epoch(model, loader, optimizer, image_loss_fn, lambda_reg, bend_weight
         optimizer.zero_grad(set_to_none=True)
         with autocast_context(device, amp_enabled):
             warped, flow = model(torch.cat((source, target), dim=1))
-            image_loss = image_loss_fn(target, warped, mask)
-            smoothness = gradient_loss(flow)
-            bending = bending_loss(flow) if bend_weight > 0 else flow.new_tensor(0.0)
-            loss = image_loss + lambda_reg * smoothness + bend_weight * bending
+        image_loss = image_loss_fn(target.float(), warped.float(), mask)
+        smoothness = gradient_loss(flow.float())
+        bending = bending_loss(flow.float()) if bend_weight > 0 else flow.new_tensor(0.0)
+        loss = image_loss + lambda_reg * smoothness + bend_weight * bending
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -387,16 +436,16 @@ def validate(model, label_transform, loader, image_loss_fn, lambda_reg, bend_wei
             source_label = batch["source_label"].to(device).float()
             target_label = batch["target_label"].to(device).long()
             warped_label = label_transform(source_label, flow).round().long()
-            dice_scores.append(dice_score(warped_label, target_label))
+            labels = common_labels(source_label, target_label)
+            dice_scores.append(dice_score(warped_label, target_label, labels))
             if compute_extra:
                 warped_np = warped_label.cpu().numpy()
                 target_np = target_label.cpu().numpy()
                 label_hd95 = []
-                for label in np.unique(np.concatenate((warped_np, target_np))):
-                    if label > 0:
-                        value = compute_hd95(target_np[0, 0] == label, warped_np[0, 0] == label)
-                        if np.isfinite(value):
-                            label_hd95.append(value)
+                for label in labels:
+                    value = compute_hd95(target_np[0, 0] == label, warped_np[0, 0] == label)
+                    if np.isfinite(value):
+                        label_hd95.append(value)
                 if label_hd95:
                     hd95_scores.append(float(np.mean(label_hd95)))
         if compute_extra:
@@ -424,22 +473,27 @@ def main():
     parser.add_argument("--mr-val-dir", default="/root/autodl-tmp/classedAbdomenMRCT_norm_300/val/images/mr")
     parser.add_argument("--ct-val-label-dir", default="/root/autodl-tmp/classedAbdomenMRCT_norm_300/val/labels/ct")
     parser.add_argument("--mr-val-label-dir", default="/root/autodl-tmp/classedAbdomenMRCT_norm_300/val/labels/mr")
+    parser.add_argument("--ct-test-dir", default="/root/autodl-tmp/classedAbdomenMRCT_norm_300/test/images/ct")
+    parser.add_argument("--mr-test-dir", default="/root/autodl-tmp/classedAbdomenMRCT_norm_300/test/images/mr")
+    parser.add_argument("--ct-test-label-dir", default="/root/autodl-tmp/classedAbdomenMRCT_norm_300/test/labels/ct")
+    parser.add_argument("--mr-test-label-dir", default="/root/autodl-tmp/classedAbdomenMRCT_norm_300/test/labels/mr")
     parser.add_argument("--output", default="/root/autodl-tmp/models/multimodal_transmorph.pt")
     parser.add_argument("--transmorph-config", default="TransMorph", choices=sorted(CONFIGS_TM))
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--samples-per-epoch", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--lambda", dest="lambda_reg", type=float, default=0.01)
+    parser.add_argument("--samples-per-epoch", type=int, default=500)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--lambda", dest="lambda_reg", type=float, default=1.25)
     parser.add_argument("--bend-weight", type=float, default=0.0)
-    parser.add_argument("--image-loss", choices=("ncc", "mse", "mind"), default="mind")
+    parser.add_argument("--image-loss", choices=("ncc", "mse", "mind", "mi"), default="mi")
+    parser.add_argument("--mi-bins", type=int, default=32)
     parser.add_argument("--ncc-window", type=int, default=9)
     parser.add_argument("--mind-radius", type=int, default=2)
     parser.add_argument("--mind-dilation", type=int, default=2)
-    parser.add_argument("--loss-mask-mode", choices=("auto", "none"), default="auto")
-    parser.add_argument("--warmup-epochs", type=int, default=10)
-    parser.add_argument("--integration-steps", type=int, default=0)
+    parser.add_argument("--loss-mask-mode", choices=("auto", "none"), default="none")
+    parser.add_argument("--warmup-epochs", type=int, default=3)
+    parser.add_argument("--integration-steps", type=int, default=7)
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--gpu", default="0")
     parser.add_argument("--disable-amp", action="store_true")
@@ -455,16 +509,16 @@ def main():
     train_set = MultimodalTrainDataset(
         args.ct_dir, args.mr_dir, args.paired_ct_dir, args.paired_mr_dir, args.samples_per_epoch
     )
-    val_set = MultimodalValidationDataset(
-        args.ct_val_dir, args.mr_val_dir, args.ct_val_label_dir, args.mr_val_label_dir
+    test_set = MultimodalValidationDataset(
+        args.ct_test_dir, args.mr_test_dir, args.ct_test_label_dir, args.mr_test_label_dir, paired=True
     )
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=device.type == "cuda")
-    val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=device.type == "cuda")
+    test_loader = DataLoader(test_set, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=device.type == "cuda")
 
     image_size = tuple(train_set[0]["source"].shape[1:])
     model = create_model(args.transmorph_config, image_size, args.integration_steps, device)
     label_transform = TransMorph.SpatialTransformer(image_size, mode="nearest").to(device)
-    image_loss_fn = ImageLoss(args.image_loss, args.ncc_window, args.mind_radius, args.mind_dilation).to(device)
+    image_loss_fn = ImageLoss(args.image_loss, args.ncc_window, args.mind_radius, args.mind_dilation, args.mi_bins).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, amsgrad=True)
     warmup = max(0, min(args.warmup_epochs, args.epochs - 1))
     if warmup:
@@ -481,13 +535,17 @@ def main():
 
     amp_enabled = device.type == "cuda" and not args.disable_amp
     scaler = create_grad_scaler(amp_enabled)
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    log_path = output.parent / f"{output.stem}_log.csv"
+    requested_output = Path(args.output)
+    timestamp = os.environ.get("RUN_TIMESTAMP") or datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = requested_output.parent / f"{requested_output.stem}_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    output = run_dir / requested_output.name
+    log_path = run_dir / "train_log.csv"
+    print(f"Output directory for this run: {run_dir}")
     with log_path.open("w", newline="") as file:
         csv.writer(file).writerow([
             "epoch", "train_loss", "image_loss", "gradient_loss", "bending_loss",
-            "val_loss", "val_dsc", "val_hd95", "val_jac", "val_mag", "lr", "seconds",
+            "test_loss", "test_dsc", "test_hd95", "test_jac", "test_mag", "lr", "seconds",
         ])
 
     best_dsc = 0.0
@@ -498,19 +556,19 @@ def main():
             model, train_loader, optimizer, image_loss_fn, args.lambda_reg, args.bend_weight,
             args.loss_mask_mode, device, scaler, amp_enabled
         )
-        val_loss, val_dsc, _, _, _ = validate(
-            model, label_transform, val_loader, image_loss_fn, args.lambda_reg, args.bend_weight,
+        test_loss, test_dsc, _, _, _ = validate(
+            model, label_transform, test_loader, image_loss_fn, args.lambda_reg, args.bend_weight,
             args.loss_mask_mode, device, compute_extra=False
         )
-        is_new_best = val_dsc > best_dsc
-        compute_extra = epoch_num in (1, 3, 5, 7) or epoch_num % 10 == 0 or (is_new_best and val_dsc > 0.77)
+        is_new_best = test_dsc > best_dsc
+        compute_extra = epoch_num in (1, 3, 5, 7) or epoch_num % 10 == 0 or (is_new_best and test_dsc > 0.77)
         if compute_extra:
-            val_loss, val_dsc, val_hd95, val_jac, val_mag = validate(
-                model, label_transform, val_loader, image_loss_fn, args.lambda_reg, args.bend_weight,
+            test_loss, test_dsc, test_hd95, test_jac, test_mag = validate(
+                model, label_transform, test_loader, image_loss_fn, args.lambda_reg, args.bend_weight,
                 args.loss_mask_mode, device, compute_extra=True
             )
         else:
-            val_hd95 = val_jac = val_mag = float("nan")
+            test_hd95 = test_jac = test_mag = float("nan")
         scheduler.step()
         elapsed = time.time() - start
         lr = optimizer.param_groups[0]["lr"]
@@ -518,30 +576,34 @@ def main():
             print(
                 f"Epoch {epoch_num}/{args.epochs}, Loss: {train_values[0]:.6f}, "
                 f"Img: {train_values[1]:.6f}, Grad: {train_values[2]:.6f}, "
-                f"Val DSC: {val_dsc:.6f}, HD95: {val_hd95:.2f}, Jac: {val_jac:.4f}, "
-                f"Mag: {val_mag:.4f}, LR: {lr:.6f}, Time: {elapsed:.2f}s"
+                f"Test DSC: {test_dsc:.6f}, HD95: {test_hd95:.6f}, Jac: {test_jac:.6f}, "
+                f"Mag: {test_mag:.6f}, LR: {lr:.8f}, Time: {elapsed:.2f}s"
             )
         else:
             print(
                 f"Epoch {epoch_num}/{args.epochs}, Loss: {train_values[0]:.6f}, "
                 f"Img: {train_values[1]:.6f}, Grad: {train_values[2]:.6f}, "
-                f"Val DSC: {val_dsc:.6f}, LR: {lr:.6f}, Time: {elapsed:.2f}s"
+                f"Test DSC: {test_dsc:.6f}, LR: {lr:.8f}, Time: {elapsed:.2f}s"
             )
         with log_path.open("a", newline="") as file:
             csv.writer(file).writerow([
-                epoch_num, *train_values, val_loss, val_dsc,
-                f"{val_hd95:.2f}" if compute_extra else "",
-                f"{val_jac:.6f}" if compute_extra else "",
-                f"{val_mag:.6f}" if compute_extra else "",
-                lr, elapsed,
+                epoch_num,
+                *(f"{value:.6f}" for value in train_values),
+                f"{test_loss:.6f}",
+                f"{test_dsc:.6f}",
+                f"{test_hd95:.6f}" if compute_extra else "",
+                f"{test_jac:.6f}" if compute_extra else "",
+                f"{test_mag:.6f}" if compute_extra else "",
+                f"{lr:.8f}",
+                f"{elapsed:.2f}",
             ])
         if compute_extra:
             try:
-                save_qualitative_results(model, label_transform, val_set, output.parent, epoch_num, device)
+                save_qualitative_results(model, label_transform, test_set, output.parent, epoch_num, device)
             except Exception as error:
                 print(f"Failed to save visualization: {error}")
         if is_new_best:
-            best_dsc = val_dsc
+            best_dsc = test_dsc
             torch.save(model.state_dict(), output.parent / f"{output.stem}_best.pt")
             print(f"Saved new best model with DSC: {best_dsc:.6f}")
         if args.save_every > 0 and epoch_num % args.save_every == 0:
